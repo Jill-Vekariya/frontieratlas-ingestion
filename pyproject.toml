@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "frontieratlas-ingestion"
+version = "1.0.0"
+description = "Source-linked catalog and freshness-verified signal ingestion."
+requires-python = ">=3.11"
+dependencies = ["aiohttp>=3.10,<4", "lxml>=5,<7"]
+
+[project.scripts]
+frontieratlas = "frontieratlas.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
