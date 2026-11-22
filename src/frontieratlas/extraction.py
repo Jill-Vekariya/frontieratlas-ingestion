@@ -44,28 +44,34 @@ class Provider:
         if self.name == "Gemini":
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"responseMimeType": "application/json", "maxOutputTokens": 650},
+                "generationConfig": {"responseMimeType": "application/json", "maxOutputTokens": 1600},
             }
+            if self.model == "gemini-3.8-flash":
+                payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "LOW"}
             route = f"{self.endpoint}/{self.model}:generateContent"
             response = await http.request(route, headers={"x-goog-api-key": self.key}, payload=payload, limit=150_000)
             parts = response.json()["candidates"][0]["content"]["parts"]
-            return json.loads("".join(part.get("text", "") for part in parts))
+            return json.loads("".join(part.get("text", "") for part in parts if not part.get("thought")))
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
-            "max_tokens": 450,
         }
         if self.name == "DeepSeek":
             payload["thinking"] = {"type": "disabled"}
+            payload["max_tokens"] = 650
+        else:
+            payload["max_completion_tokens"] = 1600
+            if self.model.startswith("openai/gpt-oss-"):
+                payload["reasoning_effort"] = "low"
         response = await http.request(self.endpoint, headers={"Authorization": "Bearer " + self.key}, payload=payload, limit=150_000)
         return json.loads(response.json()["choices"][0]["message"]["content"])
 
 
 def configured_providers() -> list[Provider]:
     configs = [
-        ("Gemini", "https://generativelanguage.googleapis.com/v1beta/models", "gemini-2.5-flash", "GEMINI"),
-        ("Groq", "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile", "GROQ"),
+        ("Gemini", "https://generativelanguage.googleapis.com/v1beta/models", "gemini-3.8-flash", "GEMINI"),
+        ("Groq", "https://api.groq.com/openai/v1/chat/completions", "openai/gpt-oss-120b", "GROQ"),
         ("DeepSeek", "https://api.deepseek.com/chat/completions", "deepseek-flash", "DEEPSEEK"),
     ]
     return [

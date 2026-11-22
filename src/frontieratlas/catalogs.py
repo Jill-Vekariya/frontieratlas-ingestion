@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, date, datetime, timedelta
 from urllib.parse import urlencode, urljoin
 
@@ -17,8 +18,19 @@ LOG = logging.getLogger(__name__)
 YC = "https://yc-oss.github.io/api/companies/all.json"
 AGI = "https://agipicks.com/data/tools.json"
 PWC = "https://paperswithcode.co"
+MARKETPLACE = "https://marketplace.visualstudio.com"
 PRICE = {"free": "FREE", "freemium": "FREEMIUM", "paid": "PAID", "contact-sales": "ENTERPRISE"}
 ORGANIZATION = {"Organization", "Corporation", "LocalBusiness", "EducationalOrganization"}
+PUBLISHER_RELATION = re.compile(
+    r"(?i:operated by|owned by|provided by|offered by|published by|agreement between you and)\s+"
+    r"([\w &.,’'-]{2,80}?\s+(?:Inc\.?|LLC|Ltd\.?|Limited|Corp\.?|Corporation|GmbH|PBC|PLC|B\.V\.))"
+    r"(?=\s*[,.;(]|\s*$)"
+)
+MARKETPLACE_CATEGORIES = ("AI", "Machine Learning", "Chat")
+MARKETPLACE_TOPIC = re.compile(
+    r"\b(?:AI|LLMs?|GPT|Copilot|Claude|machine learning|deep learning|language models?|neural networks?)\b",
+    re.I,
+)
 
 
 def startup_rows(directory: list[dict], limit: int, end: datetime):
@@ -67,7 +79,7 @@ def json_nodes(value):
 
 def publisher_from_html(body: bytes, website: str) -> tuple[str, str] | None:
     doc = html.fromstring(body)
-    organizations: set[str] = set()
+    organizations: dict[int, set[str]] = {0: set(), 1: set()}
     for block in doc.xpath('//script[@type="application/ld+json"]'):
         try:
             data = json.loads(block.text or "")
@@ -82,10 +94,67 @@ def publisher_from_html(body: bytes, website: str) -> tuple[str, str] | None:
             claim = item.get("url") or item.get("@id")
             name = clean(item.get("legalName") or item.get("name"))
             if isinstance(claim, str) and domain(urljoin(website, claim)) == domain(website) and 2 <= len(name) <= 80:
-                organizations.add(name)
-    if len(organizations) == 1:
-        return next(iter(organizations)), website
+                organizations[int(not item.get("legalName"))].add(name)
+    candidates = organizations[0] or organizations[1]
+    if len(candidates) == 1:
+        return next(iter(candidates)), website
     return None
+
+
+def bears_product_name(candidate: str, product_name: str) -> bool:
+    name = "".join(text_key(candidate).split())
+    product_key = "".join(text_key(product_name).split())
+    return len(product_key) >= 3 and product_key in name
+
+
+def product_copyright(doc, product_name: str) -> str | None:
+    candidates = set()
+    for footer in doc.xpath('//footer|//*[@role="contentinfo"]'):
+        for raw in footer.xpath(".//text()"):
+            line = clean(raw)
+            match = re.search(r"(?:©|\bcopyright\b)\s*(?:©\s*)?(?:\d{4}\s*)?(.{2,80})$", line, re.I)
+            if not match:
+                continue
+            name = re.split(r"all rights reserved|[|•·]", match[1], maxsplit=1, flags=re.I)[0].strip(" .,-–")
+            if bears_product_name(name, product_name):
+                candidates.add(name)
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+async def publisher_evidence(http: Http, website: str, product_name: str):
+    page = await http.request(website, limit=3_800_000)
+    if domain(page.url) != domain(website):
+        return None
+    if evidence := publisher_from_html(page.body, page.url):
+        return evidence
+    doc = html.fromstring(page.body)
+    if name := product_copyright(doc, product_name):
+        return name, page.url
+
+    policies = []
+    for link in doc.xpath("//a[@href]"):
+        label = clean(link.text_content())
+        if not re.fullmatch(r"terms(?: of (?:service|use))?|privacy(?: policy| notice)?|legal notice", label, re.I):
+            continue
+        url = public_url(urljoin(page.url, link.get("href")))
+        if url and domain(url) == domain(page.url) and url not in policies:
+            policies.append(url)
+    operators = {}
+    for url in policies[:2]:
+        try:
+            policy = await http.request(url, limit=3_800_000)
+            if domain(policy.url) != domain(page.url):
+                continue
+            paragraphs = html.fromstring(policy.body).xpath("//p|//li")
+            for para in paragraphs[:120]:
+                line = clean(para.text_content())
+                for match in PUBLISHER_RELATION.finditer(line[:1400]):
+                    name = clean(match[1])
+                    if bears_product_name(name, product_name):
+                        operators.setdefault(name.casefold(), (name, policy.url))
+        except (FetchError, ValueError, etree.ParserError):
+            continue
+    return next(iter(operators.values())) if len(operators) == 1 else None
 
 
 def product_candidates(directory: list[dict]):
@@ -108,11 +177,9 @@ async def product_row(http: Http, resolver: Resolver, row: dict, inspect_vendor:
     owner_source = website
     if inspect_vendor and not owner:
         try:
-            response = await http.request(website, limit=850_000)
-            if domain(response.url) == domain(website):
-                if discovered := publisher_from_html(response.body, response.url):
-                    raw_owner, owner_source = discovered
-                    owner = resolver.resolve(raw_owner, website, owner_source)
+            if discovered := await publisher_evidence(http, website, name):
+                raw_owner, owner_source = discovered
+                owner = resolver.resolve(raw_owner, website, owner_source)
         except (FetchError, ValueError, etree.ParserError):
             LOG.debug("Vendor metadata unavailable at %s", domain(website))
     content = {
@@ -131,6 +198,93 @@ async def product_row(http: Http, resolver: Resolver, row: dict, inspect_vendor:
     if owner:
         aliases.append((raw_owner, owner.canonical, owner.rule, owner_source, owner.evidence))
     return item, aliases
+
+
+def marketplace_product(row: dict, resolver: Resolver):
+    publisher = row.get("publisher", {})
+    vendor = clean(publisher.get("displayName"))
+    publisher_id = publisher.get("publisherName", "")
+    extension = row.get("extensionName", "")
+    website = public_url(publisher.get("domain"))
+    name = clean(row.get("displayName"))
+    if not (publisher.get("isDomainVerified") is True and website and vendor and name):
+        return None
+    if not all(isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9_-]+", value)
+               for value in (publisher_id, extension)):
+        return None
+    if not MARKETPLACE_TOPIC.search(f"{name} {clean(row.get('shortDescription'))}"):
+        return None
+    if re.search(r"\b(?:deprecated|nightly|pre-release|research preview|extension pack)\b", name, re.I):
+        return None
+    versions = row.get("versions") or []
+    if not versions:
+        return None
+    properties = {p["key"]: p.get("value") for p in versions[0].get("properties", [])}
+    if properties.get("Microsoft.VisualStudio.Services.Content.Pricing") != "Free":
+        return None
+    if properties.get("Microsoft.VisualStudio.Code.PreRelease") == "true":
+        return None
+    stats = {s["statisticName"]: s.get("value") for s in row.get("statistics", [])}
+    if (stats.get("install") or 0) < 100:
+        return None
+    key = f"{publisher_id}.{extension}"
+    detail = f"{MARKETPLACE}/items?{urlencode({'itemName': key})}"
+    resolved = resolver.resolve(name=vendor, website=website, evidence=detail)
+    canonical = resolved.canonical if resolved else vendor
+    rule = "Verified Marketplace publisher"
+    category = next((c for c in MARKETPLACE_CATEGORIES if c in row.get("categories", [])), "AI")
+    content = {
+        "productName": name,
+        "startupName": canonical,
+        "pricingModel": "FREE",
+        "sourcePricingModel": "Free",
+        "pricingScope": "Marketplace extension access",
+        "website": website,
+        "category": category,
+        "publisherEvidence": {"url": detail, "rule": rule},
+    }
+    item = record("PRODUCT", "vs-marketplace/" + key.casefold(), "Visual Studio Marketplace", detail, content)
+    return item, [(name, name, "Marketplace listing name", detail, detail), (vendor, canonical, rule, detail, detail)]
+
+
+async def marketplace_products(http: Http, resolver: Resolver):
+    seen_ids = set()
+    for category in MARKETPLACE_CATEGORIES:
+        page = 1
+        seen_pages = set()
+        while True:
+            payload = {
+                "filters": [{
+                    "criteria": [
+                        {"filterType": 8, "value": "Microsoft.VisualStudio.Code"},
+                        {"filterType": 5, "value": category},
+                        {"filterType": 12, "value": "4096"},
+                    ],
+                    "pageNumber": page, "pageSize": 50, "sortBy": 4, "sortOrder": 0,
+                }],
+                "assetTypes": [],
+                "flags": 788,  # Latest version, properties, category and tags, and statistics.
+            }
+            data = (await http.request(
+                f"{MARKETPLACE}/_apis/public/gallery/extensionquery",
+                headers={"Accept": "application/json;api-version=7.2-preview.1"}, payload=payload,
+            )).json()["results"][0]["extensions"]
+            if not data:
+                break
+            page_ids = tuple(row["extensionId"] for row in data)
+            if page_ids in seen_pages:
+                LOG.warning("Marketplace returned the same %s page twice", category)
+                break
+            seen_pages.add(page_ids)
+            for row in data:
+                if row["extensionId"] in seen_ids:
+                    continue
+                seen_ids.add(row["extensionId"])
+                if candidate := marketplace_product(row, resolver):
+                    yield candidate
+            if len(data) < 50:
+                break
+            page += 1
 
 
 async def paper_pages(http: Http):

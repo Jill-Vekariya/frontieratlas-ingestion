@@ -6,8 +6,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
-from frontieratlas.catalogs import product_candidates, startup_rows
-from frontieratlas.extraction import attach_extraction, dense_chunks, enrich, verify_fields
+from frontieratlas.catalogs import marketplace_product, product_candidates, publisher_evidence, startup_rows
+from frontieratlas.extraction import Provider, attach_extraction, dense_chunks, enrich, verify_fields
 from frontieratlas.http import FetchError, Http, retry_after
 from frontieratlas.identity import Resolver
 from frontieratlas.model import identifier, publication, public_url, record
@@ -73,6 +73,26 @@ class RecordTests(unittest.TestCase):
         xml = b'<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>Title</title><link rel="alternate" href="https://example.com/news" /><updated>2026-11-21T04:00:00Z</updated></entry></feed>'
         self.assertIsNone(next(feed_entries(feed, xml)).raw_date)
 
+    def test_marketplace_product_requires_verified_publisher_and_explicit_free_price(self):
+        publisher = {"displayName": "Example", "publisherName": "example", "domain": "https://example.com",
+                     "isDomainVerified": False}
+        price = {"key": "Microsoft.VisualStudio.Services.Content.Pricing", "value": "Trial"}
+        raw = {
+            "publisher": publisher, "extensionName": "ml", "displayName": "Example ML",
+            "shortDescription": "Tools for machine learning",
+            "versions": [{"properties": [price]}], "statistics": [{"statisticName": "install", "value": 200}],
+        }
+        resolver = Resolver([])
+        self.assertIsNone(marketplace_product(raw, resolver))
+        publisher["isDomainVerified"] = True
+        self.assertIsNone(marketplace_product(raw, resolver))
+        price["value"] = "Free"
+        item, aliases = marketplace_product(raw, resolver)
+        self.assertEqual(item["content"]["startupName"], "Example")
+        self.assertEqual(item["content"]["pricingModel"], "FREE")
+        self.assertEqual(item["source"]["url"], "https://marketplace.visualstudio.com/items?itemName=example.ml")
+        self.assertEqual(len(aliases), 2)
+
     def test_claim_and_export_are_idempotent(self):
         with tempfile.TemporaryDirectory() as out:
             db = Store(Path(out) / "test.sqlite3")
@@ -109,6 +129,74 @@ class RecordTests(unittest.TestCase):
 
 
 class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_official_terms_must_identify_the_product_operator(self):
+        site = "https://example.com"
+        pages = {
+            site: b'<html><footer>Copyright 2026 Processor LLC. <a href="/terms">Terms of Service</a></footer></html>',
+            site + "/terms": b"<p>This service is provided by Example AI LLC.</p><p>Payments are provided by Processor LLC.</p>",
+        }
+
+        class Transport:
+            async def request(self, url, **_kwargs):
+                return SimpleNamespace(url=url, body=pages[url])
+
+        self.assertEqual(await publisher_evidence(Transport(), site, "Example AI"), ("Example AI LLC", site + "/terms"))
+
+    async def test_full_page_is_requested_for_long_feed_excerpt(self):
+        feed = next(source for source in FEEDS if source.name == "Ars Technica")
+        story = "https://example.com/news"
+        paragraph = "A long public article opening. " * 40
+        rss = f"""<rss xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><item>
+        <title>Public story</title><link>{story}</link><pubDate>21 Nov 2026 05:00:00 GMT</pubDate>
+        <content:encoded><![CDATA[<p>{paragraph}</p><a href="{story}">Read full article</a>]]></content:encoded>
+        </item></channel></rss>""".encode()
+        page = f"<article><p>{paragraph}</p><p>{'The full story continues. ' * 40}</p></article>".encode()
+
+        class Transport:
+            parallel = 4
+
+            async def request(self, url, **_kwargs):
+                return SimpleNamespace(body=page if url == story else rss, date=END)
+
+        with tempfile.TemporaryDirectory() as output:
+            store = Store(":memory:")
+            try:
+                await scan_feed(Transport(), feed, store, END, Resolver([]), [])
+                store.export(Path(output), END, [])
+                content = json.loads((Path(output) / "records.jsonl").read_text())["content"]
+                self.assertEqual(content["bodySource"], "Publisher page")
+                self.assertGreater(content["bodyCharacterCount"], len(paragraph))
+            finally:
+                store.close()
+
+    async def test_provider_request_and_response_contracts(self):
+        result = {"fields": [{"key": "title", "value": "Public title", "evidence": "Public title"}]}
+
+        class Transport:
+            async def request(self, url, *, headers, payload, limit):
+                self.call = (url, headers, payload)
+                if "x-goog-api-key" in headers:
+                    return SimpleNamespace(json=lambda: {
+                        "candidates": [{"content": {"parts": [{"text": json.dumps(result)}]}}]
+                    })
+                return SimpleNamespace(json=lambda: {
+                    "choices": [{"message": {"content": json.dumps(result)}}]
+                })
+
+        for name in ("Gemini", "Groq", "DeepSeek"):
+            with self.subTest(provider=name):
+                transport = Transport()
+                provider = Provider(name, "https://example.com/v1", "test-model", "fixture")
+                self.assertEqual(await provider.extract(transport, "Public title"), result)
+                url, headers, payload = transport.call
+                if name == "Gemini":
+                    self.assertTrue(url.endswith("/test-model:generateContent"))
+                    self.assertEqual(headers.get("x-goog-api-key"), "fixture")
+                    self.assertEqual(payload["generationConfig"]["responseMimeType"], "application/json")
+                else:
+                    self.assertEqual(headers.get("Authorization"), "Bearer fixture")
+                    self.assertEqual(payload["response_format"]["type"], "json_object")
+
     async def test_recent_feed_time_cannot_override_older_job_date(self):
         feed = next(f for f in FEEDS if f.name == "Himalayas")
         listing = "https://himalayas.app/companies/example/jobs/ml-engineer"

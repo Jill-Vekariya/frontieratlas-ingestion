@@ -25,6 +25,7 @@ ATOM = "{http://www.w3.org/2005/Atom}"
 HTML_CONTENT = "{http://purl.org/rss/1.0/modules/content/}encoded"
 DC_AUTHOR = "{http://purl.org/dc/elements/1.1/}creator"
 HIMALAYAS = "{https://himalayas.app/ns/jobs}"
+EXCERPT_LINK = re.compile(r"(?:read (?:the )?(?:full )?(?:article|story)|continue reading)[.… ]*", re.I)
 AI_ROLE = re.compile(r"\b(?:AI|ML|LLMs?|artificial intelligence|machine learning|deep learning|data scien(?:ce|tist)|computer vision|natural language processing|GenAI|applied scientist|reinforcement learning)\b", re.I)
 AI_WORK = re.compile(r"\b(?:train\w*|build\w*|develop\w*|evaluat\w*|deploy\w*|integrat\w*|improv\w*|design\w*)\b[^.!?]{0,45}\b(?:AI (?:models?|systems?|applications?|infrastructure)|machine learning|large language models?|LLMs?|computer vision|foundation models?)\b", re.I)
 WIRED_TOPIC = re.compile(r"\b(?:AI|Nvidia|Gemini|Claude|Anthropic|OpenAI|ChatGPT|LLMs?|generative|artificial intelligence)\b", re.I)
@@ -74,6 +75,7 @@ class Listing:
     location: str = ""
     categories: tuple[str, ...] = ()
     author: str = ""
+    body_is_excerpt: bool = False
 
 
 def plain(raw: str) -> str:
@@ -85,6 +87,14 @@ def plain(raw: str) -> str:
         return "\n".join(filter(None, paragraphs)) if paragraphs else clean(tree.text_content())
     except (ValueError, etree.ParserError):
         return clean(raw)
+
+
+def has_read_more(raw: str) -> bool:
+    try:
+        doc = html.fromstring(raw)
+    except (ValueError, etree.ParserError):
+        return False
+    return any(EXCERPT_LINK.fullmatch(clean(link.text_content())) for link in doc.xpath("//a"))
 
 
 def feed_entries(feed: Feed, body: bytes):
@@ -99,7 +109,8 @@ def feed_entries(feed: Feed, body: bytes):
             stamp = row.findtext("pubDate") or row.findtext(ATOM + "published")
             tag = "Atom published" if atom else "RSS pubDate"
             summary = plain(row.findtext("description") or row.findtext(ATOM + "summary"))
-            article = plain(row.findtext(HTML_CONTENT) or row.findtext(ATOM + "content") or "")
+            raw_article = row.findtext(HTML_CONTENT) or row.findtext(ATOM + "content") or ""
+            article = plain(raw_article)
             topics = tuple(clean(x.text) for x in row.findall("category") if x.text)
             author = clean(row.findtext(DC_AUTHOR) or row.findtext(f"{ATOM}author/{ATOM}name"))
             if feed.name == "We Work Remotely":
@@ -110,7 +121,8 @@ def feed_entries(feed: Feed, body: bytes):
                 restrictions = tuple(clean(x.text) for x in row.findall(HIMALAYAS + "locationRestriction") if x.text)
                 yield Listing(title, public_url(link), stamp, tag, summary, article, clean(row.findtext(HIMALAYAS + "companyName")), ", ".join(restrictions), topics, author)
             else:
-                yield Listing(title, public_url(link), stamp, tag, summary, article, categories=topics, author=author)
+                yield Listing(title, public_url(link), stamp, tag, summary, article, categories=topics, author=author,
+                              body_is_excerpt=bool(raw_article and has_read_more(raw_article)))
         return
 
     data = json.loads(body)
@@ -224,8 +236,10 @@ async def scan_feed(http: Http, feed: Feed, store: Store, end: datetime, resolve
         try:
             source_date = listing.date_field
             source_body = "Publisher feed" if listing.body else "Feed summary"
+            if listing.body_is_excerpt:
+                source_body = "Publisher feed excerpt"
             body = listing.body or listing.summary
-            if feed.kind == "JOB" or not proof or len(body) < 850:
+            if feed.kind == "JOB" or not proof or len(body) < 850 or listing.body_is_excerpt:
                 try:
                     page = await http.request(listing.url, limit=1_500_000)
                     value, method, fetched_text = inspect_page(page.body, feed.kind)

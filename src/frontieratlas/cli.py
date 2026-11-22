@@ -10,11 +10,11 @@ import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from .catalogs import AGI, YC, arxiv_timestamps, paper_rows, product_candidates, product_row, startup_rows
+from .catalogs import AGI, YC, arxiv_timestamps, marketplace_products, paper_rows, product_candidates, product_row, startup_rows
 from .extraction import FIELDS, attach_extraction, configured_providers
 from .http import FetchError, Http, batches
 from .identity import Resolver
-from .model import parse_time
+from .model import parse_time, text_key
 from .signals import scan_signals
 from .store import Store
 
@@ -40,6 +40,8 @@ def arguments():
     parser.add_argument("--parallel", type=positive, default=24)
     parser.add_argument("--paper-star-hours", type=positive, default=24)
     parser.add_argument("--enrich-vendors", action="store_true")
+    parser.add_argument("--verified-product-publishers", action="store_true",
+                        help="Require publisher evidence and use verified Marketplace listings to meet the product target")
     parser.add_argument("--arxiv-timestamps", action="store_true")
     parser.add_argument("--provider-records-per-type", type=positive,
                         help="Limit extraction requests to this many bulk records per record type")
@@ -85,15 +87,36 @@ async def collect(args) -> tuple[dict, bool]:
             if args.mode in {"all", "bulk"}:
                 for item, aliases in startup_rows(startups, args.startups, end):
                     await write_catalog_record(item, aliases)
+                product_names = set()
                 try:
                     products = (await http.request(AGI, limit=8_000_000)).json()["tools"]
                     async def fetch_product(row):
-                        return await product_row(http, resolver, row, args.enrich_vendors)
-                    subset = itertools.islice(product_candidates(products), args.products)
+                        return await product_row(http, resolver, row, args.enrich_vendors or args.verified_product_publishers)
+                    subset = product_candidates(products)
+                    if not args.verified_product_publishers:
+                        subset = itertools.islice(subset, args.products)
                     async for item, aliases in batches(subset, fetch_product, args.parallel):
+                        content = item["content"]
+                        if args.verified_product_publishers and not content["publisherEvidence"]:
+                            continue
                         await write_catalog_record(item, aliases)
+                        product_names.add(text_key(content["productName"]))
+                        if collected["PRODUCT"] >= args.products:
+                            break
                 except (FetchError, ValueError, KeyError, TypeError) as error:
                     LOG.error("Product directory ended with %s", error)
+                if args.verified_product_publishers and collected["PRODUCT"] < args.products:
+                    try:
+                        async for item, aliases in marketplace_products(http, resolver):
+                            key = text_key(item["content"]["productName"])
+                            if key in product_names:
+                                continue
+                            await write_catalog_record(item, aliases)
+                            product_names.add(key)
+                            if collected["PRODUCT"] >= args.products:
+                                break
+                    except (FetchError, ValueError, KeyError, TypeError) as error:
+                        LOG.error("Marketplace directory ended with %s", error)
 
                 async def write_batch(batch):
                     ids = [item["content"]["arxivId"] for item in batch]
