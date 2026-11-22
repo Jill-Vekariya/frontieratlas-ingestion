@@ -8,9 +8,9 @@ from types import SimpleNamespace
 
 from frontieratlas.catalogs import marketplace_product, product_candidates, publisher_evidence, startup_rows
 from frontieratlas.extraction import Provider, attach_extraction, dense_chunks, enrich, verify_fields
-from frontieratlas.http import FetchError, Http, retry_after
+from frontieratlas.http import FetchError, Http, Response, retry_after
 from frontieratlas.identity import Resolver
-from frontieratlas.model import identifier, publication, public_url, record
+from frontieratlas.model import EMPLOYER_JOB_DATE, identifier, publication, public_url, record
 from frontieratlas.signals import FEEDS, feed_entries, inspect_page, scan_feed
 from frontieratlas.store import Store
 
@@ -96,7 +96,10 @@ class RecordTests(unittest.TestCase):
     def test_claim_and_export_are_idempotent(self):
         with tempfile.TemporaryDirectory() as out:
             db = Store(Path(out) / "test.sqlite3")
-            row = record("JOB", "example.com/job", "Test", "https://example.com/job", {"title": "Engineer"})
+            evidence = {"source": EMPLOYER_JOB_DATE, "url": "https://boards-api.greenhouse.io/v1/boards/example/jobs/123",
+                        "precision": "timestamp"}
+            row = record("JOB", "example.com/job", "Test", "https://example.com/job",
+                         {"title": "Engineer", "dateEvidence": evidence})
             key = identifier("JOB", "example.com/job")
             self.assertTrue(db.claim_signal(key, "first", END))
             self.assertFalse(db.claim_signal(key, "another", END))
@@ -105,9 +108,13 @@ class RecordTests(unittest.TestCase):
             self.assertFalse(db.put(row, publication=proof, owner="first"))
             self.assertTrue(db.put(row, publication=proof, owner="another", body="example"))
             self.assertFalse(db.claim_signal(key, "first", END + timedelta(minutes=20)))
+            legacy = record("JOB", "example.com/old", "Test", "https://example.com/old",
+                            {"title": "Reposted role", "dateEvidence": {"source": "RSS pubDate"}})
+            db.put(legacy, [("Example", "Example Corp", "Alias", "https://example.com/old", "https://example.com")], proof)
             result = db.export(Path(out), END, [])
             self.assertEqual(result["counts"]["JOB"], 1)
             self.assertEqual(len((Path(out) / "records.jsonl").read_text().splitlines()), 1)
+            self.assertEqual(len((Path(out) / "Entity Mapping Log.csv").read_text().splitlines()), 1)
             self.assertEqual(db.export(Path(out), END + timedelta(days=1), [])["counts"]["JOB"], 0)
             db.close()
 
@@ -197,28 +204,51 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(headers.get("Authorization"), "Bearer fixture")
                     self.assertEqual(payload["response_format"]["type"], "json_object")
 
-    async def test_recent_feed_time_cannot_override_older_job_date(self):
+    async def test_jobs_require_an_exact_matching_employer_publication_date(self):
         feed = next(f for f in FEEDS if f.name == "Himalayas")
         listing = "https://himalayas.app/companies/example/jobs/ml-engineer"
-        rss = f"""<rss xmlns:h="https://himalayas.app/ns/jobs"><channel><item>
-        <title>Machine Learning Engineer</title><link>{listing}</link>
+        duplicate = listing + "-reposted"
+        job_url = "https://job-boards.greenhouse.io/example/jobs/123"
+        evidence_url = "https://boards-api.greenhouse.io/v1/boards/example/jobs/123"
+        entries = "".join(f"""<item>
+        <title>Machine Learning Engineer</title><link>{url}</link>
         <h:companyName>Example</h:companyName><pubDate>21 Nov 2026 05:00:00 GMT</pubDate>
-        </item></channel></rss>""".encode()
-        older = b'<script type="application/ld+json">{"@type":"JobPosting","datePosted":"2026-11-19T05:00:00Z"}</script>'
+        </item>""" for url in (listing, duplicate))
+        rss = f'<rss xmlns:h="https://himalayas.app/ns/jobs"><channel>{entries}</channel></rss>'.encode()
+        board_date = '<script type="application/ld+json">{"@type":"JobPosting","datePosted":"2026-11-21T05:00:00Z"}</script>'
 
         class Transport:
             parallel = 4
 
-            async def request(self, url, **_kwargs):
-                return SimpleNamespace(body=older if url == listing else rss, date=END)
+            def __init__(self, link, title, timestamp):
+                board = f'<html>{board_date}<a href="{link}">Apply</a></html>'.encode()
+                item = {"id": 123, "title": title, "first_published": timestamp, "updated_at": "2026-11-21T05:00:00Z"}
+                self.pages = {feed.url: rss, listing: board, duplicate: board, evidence_url: json.dumps(item).encode()}
 
-        store = Store(":memory:")
-        try:
-            result = await scan_feed(Transport(), feed, store, END, Resolver([]), [])
-            self.assertEqual(result["published"], 0)
-            self.assertEqual(result["outsideWindowAfterPageCheck"], 1)
-        finally:
-            store.close()
+            async def request(self, url, **_kwargs):
+                return Response(url, self.pages[url], END)
+
+        for link, title, stamp, result_key, total in (
+            (job_url, "Machine Learning Engineer", "2026-11-19T05:00:00Z", "outsideWindowAfterPageCheck", 2),
+            (job_url, "Unrelated Role", "2026-11-21T04:00:00Z", "unverifiedDate", 2),
+            (job_url, "Machine Learning Engineer", "2026-11-21", "unverifiedDate", 2),
+            (job_url.replace(".io", ".io.example.com"), "Machine Learning Engineer", "2026-11-21T04:00:00Z", "unverifiedDate", 2),
+            (job_url, "Machine Learning Engineer", "2026-11-20T23:00:00-05:00", "deduplicated", 1),
+        ):
+            with self.subTest(link=link, title=title, stamp=stamp), tempfile.TemporaryDirectory() as output:
+                store = Store(":memory:")
+                try:
+                    result = await scan_feed(Transport(link, title, stamp), feed, store, END, Resolver([]), [])
+                    self.assertEqual(result[result_key], total)
+                    manifest = store.export(Path(output), END, [])
+                    self.assertEqual(manifest["counts"]["JOB"], int(result_key == "deduplicated"))
+                    if result_key == "deduplicated":
+                        content = json.loads((Path(output) / "records.jsonl").read_text())["content"]
+                        self.assertEqual(content["date"], "2026-11-21T04:00:00Z")
+                        self.assertEqual(content["dateEvidence"]["url"], evidence_url)
+                        self.assertEqual(content["dateEvidence"]["source"], EMPLOYER_JOB_DATE)
+                finally:
+                    store.close()
 
     async def test_provider_cannot_replace_verified_catalog_fields(self):
         class Stub:

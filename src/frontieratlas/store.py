@@ -9,7 +9,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from .model import Publication, utc
+from .model import EMPLOYER_JOB_DATE, Publication, utc
 
 NAMES = {
     "STARTUP": "Startups",
@@ -25,6 +25,14 @@ BASE_CONTENT_FIELDS = {
     "JOB": ("title", "company", "date", "is_remote", "role_family"),
     "NEWS": ("title", "date"),
 }
+SIGNAL_WINDOW = """
+  published_min >= ? AND published_max <= ?
+  AND (kind <> 'JOB' OR (
+    json_extract(payload, '$.content.dateEvidence.source') = ?
+    AND json_extract(payload, '$.content.dateEvidence.url') LIKE 'https://boards-api.greenhouse.io/%'
+    AND json_extract(payload, '$.content.dateEvidence.precision') = 'timestamp'
+  ))
+"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS record (
@@ -153,14 +161,15 @@ class Store:
     def export(self, destination: Path, end: datetime, coverage: list[dict]) -> dict:
         destination.mkdir(parents=True, exist_ok=True)
         lower, upper = (exact_string(end - timedelta(hours=24)), exact_string(end))
+        window = (lower, upper, EMPLOYER_JOB_DATE)
         totals = {}
         with (destination / "records.jsonl").open("w", newline="\n", encoding="utf-8") as canonical:
             for kind, filename in NAMES.items():
                 statement = "SELECT payload FROM record WHERE kind=?"
                 params = (kind,)
                 if kind in {"JOB", "NEWS"}:
-                    statement += " AND published_min >= ? AND published_max <= ?"
-                    params += (lower, upper)
+                    statement += f" AND ({SIGNAL_WINDOW})"
+                    params += window
                 statement += " ORDER BY COALESCE(published_min, first_seen) DESC, id"
                 columns = dict.fromkeys([
                     "id", "schemaVersion", "recordType", "source.name", "source.url",
@@ -180,11 +189,11 @@ class Store:
         with (destination / "Entity Mapping Log.csv").open("w", newline="", encoding="utf-8-sig") as output:
             writer = csv.writer(output)
             writer.writerow(["recordType", "source.id", "rawName", "canonicalName", "matchRule", "source.url", "canonicalEvidence.url", "collectedAt"])
-            rows = self.db.execute("""
+            rows = self.db.execute(f"""
               SELECT record.kind, m.* FROM mapping m JOIN record ON m.record_id=record.id
-              WHERE record.kind NOT IN ('JOB', 'NEWS') OR (record.published_min >= ? AND record.published_max <= ?)
+              WHERE record.kind NOT IN ('JOB', 'NEWS') OR ({SIGNAL_WINDOW})
               ORDER BY m.raw=m.canonical, record.kind, m.canonical, m.raw, m.record_id
-              """, (lower, upper))
+              """, window)
             for row in rows:
                 writer.writerow([csv_value(value) for value in row])
         manifest = {"cutoffUtc": utc(end), "windowStartUtc": utc(end - timedelta(hours=24)), "counts": totals, "feedCoverage": coverage}

@@ -8,16 +8,16 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
 from lxml import etree, html
 
 from .catalogs import json_nodes
 from .extraction import Provider, attach_extraction
-from .http import FetchError, Http, batches
+from .http import FetchError, Http, Response, batches
 from .identity import Resolver
-from .model import clean, identifier, publication, public_url, record, url_key, utc
+from .model import EMPLOYER_JOB_DATE, Publication, clean, identifier, publication, public_url, record, text_key, url_key, utc
 from .store import Store
 
 LOG = logging.getLogger(__name__)
@@ -25,6 +25,8 @@ ATOM = "{http://www.w3.org/2005/Atom}"
 HTML_CONTENT = "{http://purl.org/rss/1.0/modules/content/}encoded"
 DC_AUTHOR = "{http://purl.org/dc/elements/1.1/}creator"
 HIMALAYAS = "{https://himalayas.app/ns/jobs}"
+GREENHOUSE_HOSTS = {"boards.greenhouse.io", "job-boards.greenhouse.io"}
+GREENHOUSE_API = "boards-api.greenhouse.io"
 EXCERPT_LINK = re.compile(r"(?:read (?:the )?(?:full )?(?:article|story)|continue reading)[.… ]*", re.I)
 AI_ROLE = re.compile(r"\b(?:AI|ML|LLMs?|artificial intelligence|machine learning|deep learning|data scien(?:ce|tist)|computer vision|natural language processing|GenAI|applied scientist|reinforcement learning)\b", re.I)
 AI_WORK = re.compile(r"\b(?:train\w*|build\w*|develop\w*|evaluat\w*|deploy\w*|integrat\w*|improv\w*|design\w*)\b[^.!?]{0,45}\b(?:AI (?:models?|systems?|applications?|infrastructure)|machine learning|large language models?|LLMs?|computer vision|foundation models?)\b", re.I)
@@ -180,6 +182,60 @@ def inspect_page(markup: bytes, kind: str) -> tuple[object, str, str]:
     return publisher_date, source, body
 
 
+def greenhouse_job_api(url: str) -> str | None:
+    safe = public_url(url)
+    if not safe:
+        return None
+    parts = urlsplit(safe)
+    if parts.scheme != "https":
+        return None
+    if parts.hostname in GREENHOUSE_HOSTS and parts.path == "/embed/job_app":
+        query = parse_qs(parts.query)
+        boards, ids = query.get("for", []), query.get("token", [])
+        if len(boards) != 1 or len(ids) != 1:
+            return None
+        board, job_id = boards[0], ids[0]
+    else:
+        if parts.hostname in GREENHOUSE_HOSTS:
+            path = parts.path
+        elif parts.hostname == GREENHOUSE_API and parts.path.startswith("/v1/boards/"):
+            path = parts.path.removeprefix("/v1/boards")
+        else:
+            return None
+        match = re.fullmatch(r"/([A-Za-z0-9_-]+)/jobs/([0-9]+)", path)
+        if not match:
+            return None
+        board, job_id = match.groups()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", board) or not re.fullmatch(r"[0-9]+", job_id):
+        return None
+    return f"https://{GREENHOUSE_API}/v1/boards/{board.lower()}/jobs/{job_id}"
+
+
+async def employer_job_date(http: Http, listing: Listing, page: Response) -> tuple[Publication, str] | None:
+    direct = greenhouse_job_api(page.url) or greenhouse_job_api(listing.url)
+    if direct:
+        endpoints = {direct}
+    else:
+        links = html.fromstring(page.body).xpath("//a/@href")
+        endpoints = {url for link in links if (url := greenhouse_job_api(urljoin(page.url, link)))}
+    if len(endpoints) != 1:
+        return None
+    endpoint = endpoints.pop()
+    evidence = page if page.url == endpoint else await http.request(endpoint, limit=1_500_000)
+    if evidence.url != endpoint:
+        return None
+    item = evidence.json()
+    if not isinstance(item, dict) or str(item.get("id")) != endpoint.rsplit("/", 1)[-1]:
+        return None
+    if text_key(item.get("title")) != text_key(listing.title):
+        return None
+    value = item.get("first_published")
+    proof = publication(value) if isinstance(value, str) else None
+    if proof and proof.precision == "timestamp":
+        return proof, endpoint
+    return None
+
+
 def topic(feed: Feed, listing: Listing) -> str | None:
     if feed.kind == "NEWS":
         if feed.name == "WIRED" and not WIRED_TOPIC.search(" ".join((listing.title, listing.summary, *listing.categories))):
@@ -226,20 +282,46 @@ async def scan_feed(http: Http, feed: Feed, store: Store, end: datetime, resolve
         match_topic = topic(feed, listing)
         if not listing.url or not listing.title or not match_topic or (feed.kind == "JOB" and not listing.company):
             return
-        row_id = identifier(feed.kind, url_key(listing.url))
+        key = url_key(listing.url)
+        row_id = identifier(feed.kind, key)
         proof = publication(listing.raw_date, anchor)
         if proof and not proof.within(end):
             return
+        source_date = listing.date_field
+        date_url = listing.url
+        source_body = "Publisher feed" if listing.body else "Feed summary"
+        if listing.body_is_excerpt:
+            source_body = "Publisher feed excerpt"
+        body = listing.body or listing.summary
+        if feed.kind == "JOB":
+            evidence = None
+            try:
+                page = await http.request(listing.url, limit=1_500_000)
+                evidence = await employer_job_date(http, listing, page)
+                if evidence and page.url != evidence[1]:
+                    _, _, fetched_text = inspect_page(page.body, feed.kind)
+                    if len(fetched_text) > len(body):
+                        body, source_body = fetched_text, "Publisher page"
+            except (FetchError, etree.ParserError, ValueError):
+                LOG.debug("Employer publication evidence unavailable at %s", feed.name)
+            if not evidence:
+                store.observe(row_id, listing.url, "No verifiable first-publication timestamp from the employer")
+                counts["unverifiedDate"] += 1
+                return
+            proof, date_url = evidence
+            source_date = EMPLOYER_JOB_DATE
+            if not proof.within(end):
+                store.observe(row_id, listing.url, f"{source_date} at {date_url} is outside the collection window")
+                counts["outsideWindowAfterPageCheck"] = counts.get("outsideWindowAfterPageCheck", 0) + 1
+                return
+            key = f"greenhouse:{url_key(date_url)}"
+            row_id = identifier(feed.kind, key)
+
         if not store.claim_signal(row_id, owner, datetime.now(UTC)):
             counts["deduplicated"] += 1
             return
         try:
-            source_date = listing.date_field
-            source_body = "Publisher feed" if listing.body else "Feed summary"
-            if listing.body_is_excerpt:
-                source_body = "Publisher feed excerpt"
-            body = listing.body or listing.summary
-            if feed.kind == "JOB" or not proof or len(body) < 850 or listing.body_is_excerpt:
+            if feed.kind == "NEWS" and (not proof or len(body) < 850 or listing.body_is_excerpt):
                 try:
                     page = await http.request(listing.url, limit=1_500_000)
                     value, method, fetched_text = inspect_page(page.body, feed.kind)
@@ -263,7 +345,7 @@ async def scan_feed(http: Http, feed: Feed, store: Store, end: datetime, resolve
             content = {
                 "title": listing.title,
                 "date": utc(proof.earliest),
-                "dateEvidence": {"source": source_date, "earliest": utc(proof.earliest), "latest": utc(proof.latest), "precision": proof.precision},
+                "dateEvidence": {"source": source_date, "url": date_url, "earliest": utc(proof.earliest), "latest": utc(proof.latest), "precision": proof.precision},
                 "feedUrl": feed.url,
                 "topicEvidence": match_topic,
                 "bodySource": source_body,
@@ -279,7 +361,7 @@ async def scan_feed(http: Http, feed: Feed, store: Store, end: datetime, resolve
                     aliases.append((listing.company, company, resolved.rule, listing.url, resolved.evidence))
             else:
                 content["author"] = listing.author or None
-            output = record(feed.kind, url_key(listing.url), feed.name, listing.url, content)
+            output = record(feed.kind, key, feed.name, listing.url, content)
             if providers and body:
                 source_text = "\n".join(filter(None, (listing.company, listing.location, listing.author, body)))
                 await attach_extraction(http, providers, output, source_text)

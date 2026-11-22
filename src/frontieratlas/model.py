@@ -14,6 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 TRACKING = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 KINDS = ("STARTUP", "PRODUCT", "RESEARCH_PAPER", "JOB", "NEWS")
+EMPLOYER_JOB_DATE = "Employer Greenhouse first_published"
 SPACE = re.compile(r"\s+")
 RELATIVE = re.compile(r"^(\d+)\s*(min(?:ute)?s?|hr?s?|hours?|days?)\s+ago$", re.I)
 

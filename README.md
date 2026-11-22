@@ -54,7 +54,11 @@ The provider chain checks each field against a per-type allowlist and verifies i
 
 AGIPicks catalog data is attributed to AGIPicks under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The `ENTERPRISE` bucket represents the catalog’s contact-sales model. Marketplace rows report free extension access. A linked hosted service or model API may charge separately. Employee counts are optional when the company directory provides no value.
 
-Publication times are normalized to UTC. Relative dates use a publisher response timestamp and a conservative interval. To enter the export, the full possible publication interval must fall within the last 24 hours. An undated item is tracked by first and last observation for a later evidence check. The signal crawler checks job pages for earlier publication timestamps and records exclusions when a page predates the window. Board-only dates identify candidates that require employer or archived evidence before being treated as original publication dates. Job metadata records eligibility restrictions when provided by the source. When a news feed includes a read-more link, the crawler treats its text as an excerpt and checks the publisher page. It retains excerpt provenance if article text is unavailable.
+Publication times are normalized to UTC. Relative dates use a publisher response timestamp and a conservative interval. The full possible publication interval must fall within the last 24 hours. An undated item is tracked by first and last observation for a later evidence check.
+
+Job-board dates identify candidates. The crawler follows a Greenhouse job link, matches the job ID and title, and requires the employer's exact `first_published` timestamp inside the window. It records the timestamp evidence URL and uses the employer job ID and board for deduplication. Jobs without verifiable employer evidence are recorded as observations. Exports from reused databases apply the same evidence requirement. Job metadata records eligibility restrictions when the source provides them.
+
+When a news feed includes a read-more link, the crawler treats its text as an excerpt and checks the publisher page. It retains excerpt provenance if article text is unavailable.
 
 ## Outputs
 
