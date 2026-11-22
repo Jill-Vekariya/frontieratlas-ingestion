@@ -4,13 +4,14 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 from frontieratlas.catalogs import product_candidates, startup_rows
-from frontieratlas.extraction import dense_chunks, enrich, verify_fields
+from frontieratlas.extraction import attach_extraction, dense_chunks, enrich, verify_fields
 from frontieratlas.http import FetchError, Http, retry_after
 from frontieratlas.identity import Resolver
 from frontieratlas.model import identifier, publication, public_url, record
-from frontieratlas.signals import FEEDS, feed_entries, inspect_page
+from frontieratlas.signals import FEEDS, feed_entries, inspect_page, scan_feed
 from frontieratlas.store import Store
 
 END = datetime(2026, 11, 21, 6, 9, 3, tzinfo=UTC)
@@ -108,6 +109,51 @@ class RecordTests(unittest.TestCase):
 
 
 class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recent_feed_time_cannot_override_older_job_date(self):
+        feed = next(f for f in FEEDS if f.name == "Himalayas")
+        listing = "https://himalayas.app/companies/example/jobs/ml-engineer"
+        rss = f"""<rss xmlns:h="https://himalayas.app/ns/jobs"><channel><item>
+        <title>Machine Learning Engineer</title><link>{listing}</link>
+        <h:companyName>Example</h:companyName><pubDate>21 Nov 2026 05:00:00 GMT</pubDate>
+        </item></channel></rss>""".encode()
+        older = b'<script type="application/ld+json">{"@type":"JobPosting","datePosted":"2026-11-19T05:00:00Z"}</script>'
+
+        class Transport:
+            parallel = 4
+
+            async def request(self, url, **_kwargs):
+                return SimpleNamespace(body=older if url == listing else rss, date=END)
+
+        store = Store(":memory:")
+        try:
+            result = await scan_feed(Transport(), feed, store, END, Resolver([]), [])
+            self.assertEqual(result["published"], 0)
+            self.assertEqual(result["outsideWindowAfterPageCheck"], 1)
+        finally:
+            store.close()
+
+    async def test_provider_cannot_replace_verified_catalog_fields(self):
+        class Stub:
+            name = "Test"
+            initial_bytes = 3600
+
+            async def extract(self, _http, text):
+                self.text = text
+                return {"fields": [
+                    {"key": "productName", "value": "Example", "evidence": "Example"},
+                    {"key": "startupName", "value": "Different", "evidence": "Different"},
+                    {"key": "pricingModel", "value": "FREE", "evidence": "FREE"},
+                ]}
+
+        stub = Stub()
+        row = record("PRODUCT", "example", "Catalog", "https://example.com/tool",
+                     {"productName": "Example", "startupName": None, "pricingModel": "PAID"})
+        await attach_extraction(None, [stub], row, "Example\nDifferent products\nFREE trial")
+        self.assertIn("Record type PRODUCT", stub.text)
+        self.assertIsNone(row["content"]["startupName"])
+        self.assertEqual(row["content"]["pricingModel"], "PAID")
+        self.assertEqual([x["key"] for x in row["content"]["extractionEvidence"]], ["productName"])
+
     async def test_413_shrinks_input_and_fallback_preserves_valid_data(self):
         class Stub:
             def __init__(self, name, status=None):

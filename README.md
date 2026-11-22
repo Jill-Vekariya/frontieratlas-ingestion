@@ -23,7 +23,7 @@ python -m unittest discover -s tests -v
 For the full data targets, run the command below. Vendor metadata requests use the official websites in the product catalog and can increase runtime.
 
 ```bash
-frontieratlas --startups 1100 --products 1153 --papers 1050 --enrich-vendors --arxiv-timestamps --require-targets --out out
+frontieratlas --startups 1100 --products 1152 --papers 1050 --enrich-vendors --arxiv-timestamps --require-targets --out out
 ```
 
 Use `--mode signals` to refresh news and jobs, or `--mode bulk` to collect the catalogs. The run start fixes the UTC cutoff. A zoned `--cutoff` allows a specific historical window when the public feeds still contain that period. An existing database can be chosen with `--db`. Change `--parallel` to adjust connection concurrency and `--paper-star-hours` to adjust the maximum age of a repository metric.
@@ -32,7 +32,7 @@ With `--require-targets`, a bulk shortfall returns exit code 2 after writing the
 
 ## Extraction providers
 
-Set one or more of these environment variables to enable optional enrichment of job location and role family.
+Set one or more of these environment variables to enable evidence-checked extraction for all five record types. Use `--provider-records-per-type 5` for a limited bulk verification run.
 
 | Priority | Credential variable | Default model | Override |
 | --- | --- | --- | --- |
@@ -40,7 +40,7 @@ Set one or more of these environment variables to enable optional enrichment of 
 | 2 | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | `GROQ_MODEL` |
 | 3 | `DEEPSEEK_API_KEY` | `deepseek-flash` | `DEEPSEEK_MODEL` |
 
-The provider chain accepts an allowlisted result only when its quoted evidence appears in the submitted text. Location values must occur in the quoted span. Role families use a fixed vocabulary. Publication times, URLs, prices, organization aliases, and star counts come from structured source evidence. With no provider credentials, source fields and deterministic classifications remain available.
+The provider chain checks each field against a per-type allowlist and verifies its supporting quote in the supplied source. The pipeline accepts quoted news excerpts and explicitly labelled missing job locations. It also records evidence that corroborates structured fields. Publication times, URLs, prices, canonical names, and star counts come from the source adapters and entity resolver. With no provider credentials, the source adapters and deterministic classifications still run.
 
 ## Collection and evidence
 
@@ -54,7 +54,7 @@ The provider chain accepts an allowlisted result only when its quoted evidence a
 
 Product data attribution is AGIPicks under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The adapter deduplicates names and normalizes pricing categories. The `ENTERPRISE` bucket represents a contact-sales model reported by the catalog. The recorded pricing check date belongs to the source. Missing publisher names and employee counts are exported as blank values when the source evidence does not support a value.
 
-Publication times are normalized to UTC. Relative dates use a publisher response timestamp and a conservative interval. To enter the export, the full possible publication interval must fall within the last 24 hours. An undated item is tracked by first and last observation for a later evidence check. Job metadata records eligibility restrictions when provided by the board.
+Publication times are normalized to UTC. Relative dates use a publisher response timestamp and a conservative interval. To enter the export, the full possible publication interval must fall within the last 24 hours. An undated item is tracked by first and last observation for a later evidence check. The signal crawler checks job pages for earlier publication timestamps and records exclusions when a page predates the window. Board-only dates identify candidates that require employer or archived evidence before being treated as original publication dates. Job metadata records eligibility restrictions when provided by the source.
 
 ## Outputs
 
@@ -63,7 +63,9 @@ Publication times are normalized to UTC. Relative dates use a publisher response
 - `manifest.json` records the cutoff, source coverage, errors, and row totals.
 - `frontieratlas.sqlite3` holds durable records, deduplication leases, acquisition evidence, and metric history. The database may contain source text for internal extraction. Share the metadata exports for submission.
 
-The six-tab trial workbook represents collection on 21 November 2026. It contains 1,100 startups, 1,153 products, 1,050 research papers, 37 jobs, 17 news articles, and 3,790 mapping rows. Its signal cutoff is 06:09:03 UTC. Later runs reflect the listings and repository metrics exposed by the sources at the new cutoff.
+The six-tab [trial workbook](https://docs.google.com/spreadsheets/d/1OG6OkxV7klEeE_L3PhsFRSDz3JcRRcvjvPf7iYM6Ir8/edit) contains 1,100 startups, 1,152 products, 1,050 research papers, 0 verified fresh jobs, 17 news articles, and 3,799 mapping rows. Its signal window runs from 20 November 2026 06:09:03 UTC through 21 November 2026 06:09:03 UTC. The Jobs tab retains the evidence for 36 excluded candidates with earlier matching listings. Later runs use the listings and repository metrics available at the new cutoff.
+
+All 1,050 paper rows use exact arXiv publication timestamps. Article text was captured for all 17 news records from publisher feeds or pages. The public export carries article URLs and capture details. Publisher names have source evidence for 512 of 1,152 products. The remaining publisher fields are blank.
 
 ## Runtime design
 

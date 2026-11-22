@@ -14,7 +14,7 @@ from uuid import uuid4
 from lxml import etree, html
 
 from .catalogs import json_nodes
-from .extraction import Provider, enrich
+from .extraction import Provider, attach_extraction
 from .http import FetchError, Http, batches
 from .identity import Resolver
 from .model import clean, identifier, publication, public_url, record, url_key, utc
@@ -225,12 +225,13 @@ async def scan_feed(http: Http, feed: Feed, store: Store, end: datetime, resolve
             source_date = listing.date_field
             source_body = "Publisher feed" if listing.body else "Feed summary"
             body = listing.body or listing.summary
-            if not proof or (feed.kind == "NEWS" and len(body) < 850):
+            if feed.kind == "JOB" or not proof or len(body) < 850:
                 try:
                     page = await http.request(listing.url, limit=1_500_000)
                     value, method, fetched_text = inspect_page(page.body, feed.kind)
-                    if not proof and (publisher_proof := publication(value, page.date)):
-                        proof, source_date = publisher_proof, method
+                    if publisher_proof := publication(value, page.date):
+                        if not proof or (publisher_proof.earliest, publisher_proof.latest) < (proof.earliest, proof.latest):
+                            proof, source_date = publisher_proof, method
                     if len(fetched_text) > len(body):
                         body, source_body = fetched_text, "Publisher page"
                 except (FetchError, etree.ParserError, ValueError):
@@ -240,6 +241,8 @@ async def scan_feed(http: Http, feed: Feed, store: Store, end: datetime, resolve
                 counts["unverifiedDate"] += 1
                 return
             if not proof.within(end):
+                store.observe(row_id, listing.url, f"{source_date} puts the listing outside the collection window")
+                counts["outsideWindowAfterPageCheck"] = counts.get("outsideWindowAfterPageCheck", 0) + 1
                 return
 
             aliases = []
@@ -260,19 +263,12 @@ async def scan_feed(http: Http, feed: Feed, store: Store, end: datetime, resolve
                 content["role_family"] = next((label for pattern, label in ROLES if re.search(pattern, listing.title, re.I)), "Business Operations")
                 if resolved:
                     aliases.append((listing.company, company, resolved.rule, listing.url, resolved.evidence))
-                if providers and body:
-                    fields, provider = await enrich(http, providers, listing.title, body)
-                    if fields:
-                        content["extractionEvidence"] = fields
-                        content["extractionProvider"] = provider
-                        for field in fields:
-                            if field["key"] == "location" and not content.get("location"):
-                                content["location"] = field["value"]
-                            elif field["key"] == "role_family" and content["role_family"] == "Business Operations":
-                                content["role_family"] = field["value"]
             else:
                 content["author"] = listing.author or None
             output = record(feed.kind, url_key(listing.url), feed.name, listing.url, content)
+            if providers and body:
+                source_text = "\n".join(filter(None, (listing.company, listing.location, listing.author, body)))
+                await attach_extraction(http, providers, output, source_text)
             if store.put(output, aliases, proof, body[:100_000], owner):
                 counts["published"] += 1
         finally:

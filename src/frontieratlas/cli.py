@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .catalogs import AGI, YC, arxiv_timestamps, paper_rows, product_candidates, product_row, startup_rows
-from .extraction import configured_providers
+from .extraction import FIELDS, attach_extraction, configured_providers
 from .http import FetchError, Http, batches
 from .identity import Resolver
 from .model import parse_time
@@ -41,6 +41,8 @@ def arguments():
     parser.add_argument("--paper-star-hours", type=positive, default=24)
     parser.add_argument("--enrich-vendors", action="store_true")
     parser.add_argument("--arxiv-timestamps", action="store_true")
+    parser.add_argument("--provider-records-per-type", type=positive,
+                        help="Limit extraction requests to this many bulk records per record type")
     parser.add_argument("--require-targets", action="store_true")
     args = parser.parse_args()
     if args.cutoff and not parse_time(args.cutoff):
@@ -58,6 +60,18 @@ async def collect(args) -> tuple[dict, bool]:
     collected = {"STARTUP": 0, "PRODUCT": 0, "RESEARCH_PAPER": 0}
     try:
         async with Http(parallel=args.parallel) as http:
+            providers = configured_providers()
+
+            async def write_catalog_record(item, aliases=()):
+                kind = item["recordType"]
+                if providers and (args.provider_records_per_type is None or collected[kind] < args.provider_records_per_type):
+                    content = item["content"]
+                    fields = sorted(FIELDS[kind])
+                    text = "\n".join(f"{field}: {content[field]}" for field in fields if content.get(field))
+                    await attach_extraction(http, providers, item, text)
+                store.put(item, aliases)
+                collected[kind] += 1
+
             try:
                 startups = (await http.request(YC, limit=16_000_000)).json()
                 if not isinstance(startups, list):
@@ -67,19 +81,17 @@ async def collect(args) -> tuple[dict, bool]:
                 startups = []
             resolver = Resolver(startups)
             if args.mode in {"all", "signals"}:
-                coverage = await scan_signals(http, store, end, resolver, configured_providers())
+                coverage = await scan_signals(http, store, end, resolver, providers)
             if args.mode in {"all", "bulk"}:
                 for item, aliases in startup_rows(startups, args.startups, end):
-                    store.put(item, aliases)
-                    collected["STARTUP"] += 1
+                    await write_catalog_record(item, aliases)
                 try:
                     products = (await http.request(AGI, limit=8_000_000)).json()["tools"]
                     async def fetch_product(row):
                         return await product_row(http, resolver, row, args.enrich_vendors)
                     subset = itertools.islice(product_candidates(products), args.products)
                     async for item, aliases in batches(subset, fetch_product, args.parallel):
-                        store.put(item, aliases)
-                        collected["PRODUCT"] += 1
+                        await write_catalog_record(item, aliases)
                 except (FetchError, ValueError, KeyError, TypeError) as error:
                     LOG.error("Product directory ended with %s", error)
 
@@ -91,8 +103,7 @@ async def collect(args) -> tuple[dict, bool]:
                         if timestamp := timestamps.get(content["arxivId"]):
                             if parse_time(timestamp) <= end:
                                 content.update(published_date=timestamp, publicationPrecision="timestamp")
-                        store.put(item)
-                        collected["RESEARCH_PAPER"] += 1
+                        await write_catalog_record(item)
 
                 page = []
                 try:
